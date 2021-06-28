@@ -39,9 +39,16 @@ func Main() error {
 	}
 	gitDescVer.Patch++
 
-	_, err = fmt.Printf("v%s-%d\n", gitDescVer, time.Now().Unix())
-	if err != nil {
-		return err
+	// If an additional arg has been used, we include it in the tag
+	if len(os.Args) >= 2 {
+		t := time.Now()
+		date := fmt.Sprintf("%d.%d.%d", t.Year(), t.Month(), t.Day())
+		_, err = fmt.Printf("v%d.%d.%d-%s-%s-%s\n", gitDescVer.Major, gitDescVer.Minor, gitDescVer.Patch, os.Args[1], date, gitDescVer.Pre[0].String())
+	} else {
+		_, err = fmt.Printf("v%s-%d\n", gitDescVer, time.Now().Unix())
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
