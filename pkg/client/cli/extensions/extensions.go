@@ -299,8 +299,10 @@ func urlSchemeIsOneOf(urlStr string, schemes ...string) bool {
 }
 
 func (es *ExtensionsState) AgentImage(ctx context.Context, env client.Env) (string, error) {
-	if env.AgentImage != "" {
-		return env.AgentImage, nil
+	imgConfig := client.GetConfig(ctx).Images
+	if imgConfig.AgentImage != "" {
+		image := fmt.Sprintf("%s/%s", imgConfig.Registry, imgConfig.AgentImage)
+		return image, nil
 	}
 	if es.cachedImage.Image != "" || es.cachedImage.Err != nil {
 		return es.cachedImage.Image, es.cachedImage.Err

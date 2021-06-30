@@ -41,14 +41,12 @@ func (env Env) Get(key string) string {
 		return env.LoginClientID
 	case "TELEPRESENCE_USER_INFO_URL":
 		return env.UserInfoURL
-
 	case "TELEPRESENCE_REGISTRY":
 		return env.Registry
 	case "TELEPRESENCE_AGENT_IMAGE":
 		return env.AgentImage
 	case "TELEPRESENCE_MANAGER_NAMESPACE":
 		return env.ManagerNamespace
-
 	case "SYSTEMA_HOST":
 		return env.SystemAHost
 	case "SYSTEMA_PORT":
