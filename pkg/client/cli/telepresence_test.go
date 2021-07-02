@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -19,7 +20,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/suite"
-	"k8s.io/apimachinery/pkg/runtime"
+	"gopkg.in/yaml.v3"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
 
@@ -30,7 +32,7 @@ import (
 	"github.com/datawire/dlib/dhttp"
 	"github.com/datawire/dlib/dlog"
 	"github.com/telepresenceio/telepresence/v2/pkg/client"
-	_ "github.com/telepresenceio/telepresence/v2/pkg/client/cli"
+	"github.com/telepresenceio/telepresence/v2/pkg/client/cli"
 	"github.com/telepresenceio/telepresence/v2/pkg/filelocation"
 	"github.com/telepresenceio/telepresence/v2/pkg/version"
 )
@@ -94,6 +96,31 @@ func (ts *telepresenceSuite) SetupSuite() {
 	os.Setenv("TELEPRESENCE_REGISTRY", registry)
 	os.Setenv("TELEPRESENCE_MANAGER_NAMESPACE", ts.managerTestNamespace)
 
+	// Store user's config if present
+	dir, err := filelocation.AppUserConfigDir(ctx)
+	configFile := filepath.Join(dir, "config.yml")
+	if _, err := os.Stat(configFile); err == nil {
+		err := os.Rename(configFile, "/tmp/tpConfig")
+		require.NoError(err)
+	} else {
+		// If the file exists than we know the directory does as well.
+		// in this case the config file doesn't exist so we ensure that
+		// the directory exists before continuing.
+		err = os.MkdirAll(dir, 0700)
+		require.NoError(err)
+	}
+
+	// Create config to be used by tests
+	type yamlConfig struct {
+		Images struct {
+			Registry string `yaml:"registry"`
+		} `yaml:"images"`
+	}
+	ymlCfg := yamlConfig{}
+	ymlCfg.Images.Registry = registry
+	d, err := yaml.Marshal(&ymlCfg)
+	err = ioutil.WriteFile(configFile, d, 0644)
+	require.NoError(err)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -159,12 +186,17 @@ func (ts *telepresenceSuite) TearDownSuite() {
 	ctx := dlog.NewTestContext(ts.T(), false)
 	_ = run(ctx, "kubectl", "config", "use-context", "default")
 	_ = run(ctx, "kubectl", "delete", "namespace", ts.namespace)
-	_ = run(ctx, "kubectl", "delete", "mutatingwebhookconfiguration", "agent-injector-webhook-"+ts.managerTestNamespace)
 	_ = run(ctx, "kubectl", "delete", "namespace", ts.managerTestNamespace)
 	// Undo RBAC things
 	_ = run(ctx, "kubectl", "delete", "-f", "k8s/client_rbac.yaml")
 	_ = run(ctx, "kubectl", "config", "delete-context", "telepresence-test-developer")
 	_ = run(ctx, "kubectl", "config", "delete-user", "telepresence-test-developer")
+	// undo config file
+	if _, err := os.Stat("/tmp/tpConfig"); err == nil {
+		dir, _ := filelocation.AppUserConfigDir(ctx)
+		configFile := filepath.Join(dir, "config.yml")
+		_ = os.Rename("/tmp/tpConfig", configFile)
+	}
 }
 
 func (ts *telepresenceSuite) TestA_WithNoDaemonRunning() {
@@ -265,7 +297,7 @@ func (ts *telepresenceSuite) TestA_WithNoDaemonRunning() {
 			break
 		}
 		require.NotNilf(cluster, "unable to get cluster from config")
-		cluster.Extensions = map[string]runtime.Object{"telepresence.io": &runtime.Unknown{
+		cluster.Extensions = map[string]k8sruntime.Object{"telepresence.io": &k8sruntime.Unknown{
 			Raw: []byte(`{"dns":{"include-suffixes": [".org"]}}`),
 		}}
 
@@ -546,42 +578,39 @@ func (cs *connectedSuite) TestK_DockerRun() {
 	require.NoError(err)
 	abs, err := filepath.Abs(testDir)
 	require.NoError(err)
+	// Kill container on exit
+	defer func() {
+		_ = dexec.CommandContext(ctx, "docker", "kill", fmt.Sprintf("intercept-%s-%s-8000", svc, cs.ns())).Run()
+	}()
 
-	grp := dgroup.NewGroup(ctx, dgroup.GroupConfig{
-		EnableWithSoftness: true,
-		ShutdownOnNonError: true,
-	})
-
-	grp.Go("server", func(ctx context.Context) error {
-		stdout, _ := telepresenceContext(ctx, "intercept", "--namespace", cs.ns(), svc,
+	ccx, cancel := context.WithCancel(ctx)
+	stdoutCh := make(chan string)
+	go func() {
+		stdout, _ := telepresenceContext(ccx, "intercept", "--namespace", cs.ns(), svc,
 			"--docker-run", "--port", "8000", "--", "--rm", "-v", abs+":/usr/src/app", tag)
-		cs.Contains(stdout, "Using Deployment "+svc)
-		return nil
-	})
+		stdoutCh <- stdout
+	}()
 
-	grp.Go("client", func(ctx context.Context) error {
-		expectedOutput := "Hello from intercepted echo-server!"
-		cs.Eventually(
-			// condition
-			func() bool {
-				ctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-				defer cancel()
-				out, err := output(ctx, "curl", "--silent", svc)
-				if err != nil {
-					dlog.Error(ctx, err)
-					return false
-				}
-				dlog.Info(ctx, out)
-				return strings.Contains(out, expectedOutput)
-			},
-			30*time.Second, // waitFor
-			1*time.Second,  // polling interval
-			`body of %q equals %q`, "http://"+svc, expectedOutput,
-		)
-		return nil
-	})
-
-	cs.NoError(grp.Wait())
+	expectedOutput := "Hello from intercepted echo-server!"
+	cs.Eventually(
+		// condition
+		func() bool {
+			ctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			defer cancel()
+			out, err := output(ctx, "curl", "--silent", svc)
+			if err != nil {
+				dlog.Error(ctx, err)
+				return false
+			}
+			dlog.Info(ctx, out)
+			return strings.Contains(out, expectedOutput)
+		},
+		30*time.Second, // waitFor
+		1*time.Second,  // polling interval
+		`body of %q equals %q`, "http://"+svc, expectedOutput,
+	)
+	cancel()
+	cs.Contains(<-stdoutCh, "Using Deployment "+svc)
 }
 
 func (cs *connectedSuite) TestL_LegacySwapDeploymentDoesIntercept() {
@@ -994,19 +1023,27 @@ func telepresence(t testing.TB, args ...string) (string, string) {
 
 // telepresence executes the CLI command in-process
 func telepresenceContext(ctx context.Context, args ...string) (string, string) {
-	var stdout, stderr strings.Builder
+	dlog.Infof(ctx, "running command: %q", append([]string{"telepresence"}, args...))
 
-	configDir, _ := filelocation.AppUserConfigDir(ctx)
-	logDir, _ := filelocation.AppUserLogDir(ctx)
+	cmd := cli.Command(ctx)
 
-	cmd := dexec.CommandContext(ctx, client.GetExe(), args...)
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	cmd.Env = append(os.Environ(),
-		"DEV_TELEPRESENCE_CONFIG_DIR="+configDir,
-		"DEV_TELEPRESENCE_LOG_DIR="+logDir)
+	stdout := new(strings.Builder)
+	cmd.SetOut(io.MultiWriter(
+		stdout,
+		dlog.StdLogger(dlog.WithField(ctx, "stream", "stdout"), dlog.LogLevelInfo).Writer(),
+	))
 
-	_ = cmd.Run()
+	stderr := new(strings.Builder)
+	cmd.SetErr(io.MultiWriter(
+		stderr,
+		dlog.StdLogger(dlog.WithField(ctx, "stream", "stderr"), dlog.LogLevelInfo).Writer(),
+	))
 
+	cmd.SetArgs(args)
+	if err := cmd.ExecuteContext(ctx); err != nil {
+		fmt.Fprintln(cmd.ErrOrStderr(), err)
+	}
+
+	dlog.Infof(ctx, "command terminated %q", append([]string{"telepresence"}, args...))
 	return strings.TrimSpace(stdout.String()), strings.TrimSpace(stderr.String())
 }
