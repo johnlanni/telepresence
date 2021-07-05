@@ -98,8 +98,13 @@ func (o *outbound) runOverridingServer(c context.Context) error {
 		for _, line := range strings.Split(string(dat), "\n") {
 			if strings.HasPrefix(strings.TrimSpace(line), "nameserver") {
 				fields := strings.Fields(line)
-				o.dnsConfig.LocalIp = net.ParseIP(fields[1])
-				dlog.Infof(c, "Automatically set -dns=%s", o.dnsConfig.LocalIp)
+
+				// Note. Do not get rid of the intermediate ip variable here. It's essential
+				// to get the dlog printout correct since it uses `net.IP.String()`. Using %s
+				// together with `o.dnsConfig.LocalIp (which is a []byte) results in garbage.
+				ip := net.ParseIP(fields[1])
+				dlog.Infof(c, "Automatically set -dns=%s", ip)
+				o.dnsConfig.LocalIp = ip
 				break
 			}
 		}
